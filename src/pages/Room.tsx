@@ -13,16 +13,17 @@ import {
 
 import '@livekit/components-styles'
 import { useAuth } from '../contexts/AuthContext'
-import { supabase } from '../lib/supabase'
+import { useLiveKitToken } from '../hooks/useLiveKitToken'
 
 /**
- * Room page — pre-join screen + LiveKit connection (piano.md §2.3 / §2.4).
+ * Room page — pre-join screen + LiveKit connection (piano.md §2.3 / §2.4 /
+ * §2.5).
  *
  * Opening `/room/:id` shows a *pre-join* screen (`<PreJoin>`): local camera
  * preview, camera/microphone on-off toggles and device pickers, plus a speaker
  * picker. Nothing is requested from the network and no room is connected
- * during that stage — the LiveKit token is only asked for when the user
- * presses "Partecipa ora".
+ * during that stage — `useLiveKitToken().requestToken()` is only called when
+ * the user presses "Partecipa ora".
  *
  * The pre-join choices are then applied to `<LiveKitRoom audio video>`: the
  * selected device ids are used as capture options, and a device the user
@@ -30,22 +31,12 @@ import { supabase } from '../lib/supabase'
  * that turns out to be busy/denied while joining no longer aborts the
  * connection (see `handleLiveKitError`).
  *
- * Leaving the room (control bar) or a failed connection unmounts
- * `<LiveKitRoom>` — which disconnects the client — and returns to the pre-join
- * state on the same route. Errors that happen *after* the room is connected
- * (typically media/device errors) are only reported and keep the call alive.
- *
- * The token lives in component state only: it is never rendered, never logged
- * and never included in an error message. The LiveKit API key/secret stay in
- * the Edge Function and are not part of the frontend.
+ * Leaving the room (control bar "Leave", or a remote end) navigates back to the
+ * dashboard; a *failed* connection instead returns to the pre-join state on the
+ * same route so the error stays visible. Errors that happen *after* the room is
+ * connected (typically media/device errors) are only reported and keep the
+ * call alive.
  */
-
-// Same defensive read as `src/lib/supabase.ts`: a missing variable is `''`,
-// and values are never echoed into the UI or the console.
-const env = import.meta.env as unknown as Record<string, string | undefined>
-
-const liveKitServerUrl =
-  typeof env.VITE_LIVEKIT_URL === 'string' ? env.VITE_LIVEKIT_URL.trim() : ''
 
 const page: CSSProperties = {
   minHeight: '100vh',
@@ -105,10 +96,8 @@ interface JoinChoices {
   videoDeviceId?: string
 }
 
-interface Connection {
-  /** Short-lived LiveKit access token. Never displayed. */
-  token: string
-  serverUrl: string
+/** Device selection to hand to `<LiveKitRoom>` once a token is available. */
+interface JoinSettings {
   /** Capture options chosen on the pre-join screen (`false` = device off). */
   audio: { deviceId?: string } | false
   video: { deviceId?: string } | false
@@ -134,68 +123,6 @@ function readDisplayName(user: User | null): string {
   const email = user?.email?.trim() ?? ''
 
   return email ? email.split('@')[0] : 'Ospite'
-}
-
-/**
- * Extract the token from the Edge Function response without ever surfacing the
- * value. Anything unexpected is reported as "no token".
- */
-function readToken(data: unknown): string {
-  if (data === null || typeof data !== 'object') {
-    return ''
-  }
-
-  const token = (data as { token?: unknown }).token
-
-  return typeof token === 'string' ? token.trim() : ''
-}
-
-/**
- * Turn the error thrown by `functions.invoke` into a short, human-readable
- * message. For non-2xx responses the Supabase client throws a
- * `FunctionsHttpError` whose `context` is the raw `Response`; only the HTTP
- * status and the JSON `error` field sent by the Edge Function are read.
- * Nothing from the request/response headers, the token or env is included.
- */
-async function describeFunctionError(error: unknown): Promise<string> {
-  const fallback =
-    error instanceof Error && error.message
-      ? error.message
-      : 'Unknown error while calling the function.'
-
-  const context = (error as { context?: unknown }).context
-
-  if (!(context instanceof Response)) {
-    return fallback
-  }
-
-  const status = `${context.status}${context.statusText ? ` ${context.statusText}` : ''}`
-
-  try {
-    // `clone()` keeps the original response body untouched.
-    const body = await context.clone().text()
-
-    if (body) {
-      try {
-        const parsed: unknown = JSON.parse(body)
-
-        if (
-          parsed !== null &&
-          typeof parsed === 'object' &&
-          'error' in parsed &&
-          typeof (parsed as { error?: unknown }).error === 'string'
-        ) {
-          return `${(parsed as { error: string }).error} (HTTP ${status})`
-        }
-      } catch {
-        // Not JSON — fall through to the plain status message.
-      }
-    }
-  } catch {
-    // Body could not be read — fall through to the plain status message.
-  }
-
-  return `Request failed with HTTP ${status}.`
 }
 
 function describeLiveKitError(error: unknown): string {
@@ -235,14 +162,24 @@ export default function Room() {
   const { user } = useAuth()
   const displayName = readDisplayName(user)
 
+  // Token request (Edge Function) + server URL. Nothing is requested until
+  // `requestToken()` is called from `handleJoin`.
+  const {
+    serverUrl,
+    token,
+    loading,
+    error: tokenError,
+    requestToken,
+    reset: resetToken,
+  } = useLiveKitToken(roomName)
+
   // Speaker picker for the pre-join screen. Camera and microphone devices are
   // chosen with the selectors built into <PreJoin>.
   const speakerDevices = useMediaDevices({ kind: 'audiooutput' })
   const [speakerDeviceId, setSpeakerDeviceId] = useState('')
 
   const [previewError, setPreviewError] = useState<string | null>(null)
-  const [connection, setConnection] = useState<Connection | null>(null)
-  const [requesting, setRequesting] = useState(false)
+  const [settings, setSettings] = useState<JoinSettings | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   // Kept in a ref (not state) so the `onError` / `onDisconnected` handlers
@@ -252,70 +189,32 @@ export default function Room() {
 
   /**
    * Runs only when the user presses "Partecipa ora" on the pre-join screen:
-   * asks the Edge Function for a token and mounts `<LiveKitRoom>` with the
-   * device choices made on that screen.
+   * asks the hook for a token and remembers the device choices, which mounts
+   * `<LiveKitRoom>` with those choices.
    */
   async function handleJoin(choices: JoinChoices) {
-    if (!roomName) {
-      setError('The room id is missing from the URL.')
-      return
-    }
-
-    if (!liveKitServerUrl) {
-      setError(
-        'VITE_LIVEKIT_URL is not configured. Add it to `.env.local` and restart the dev server.',
-      )
-      return
-    }
-
     setError(null)
     setPreviewError(null)
-    setRequesting(true)
 
-    try {
-      // `invoke` attaches the access token of the current Supabase session
-      // automatically, so the Edge Function sees the signed-in user.
-      const { data, error: invokeError } = await supabase.functions.invoke(
-        'livekit-token',
-        { body: { roomName } },
-      )
+    // Failure is reported through the hook's `error` state; stay on pre-join.
+    const details = await requestToken()
 
-      if (invokeError) {
-        setError(await describeFunctionError(invokeError))
-        return
-      }
-
-      const token = readToken(data)
-
-      if (!token) {
-        setError('The token endpoint responded without a token.')
-        return
-      }
-
-      // Rendering `<LiveKitRoom connect>` is what actually connects. Devices
-      // the user disabled are passed as `false`, so they are not requested.
-      joinedRef.current = false
-      setConnection({
-        token,
-        serverUrl: liveKitServerUrl,
-        audio: choices.audioEnabled
-          ? { deviceId: choices.audioDeviceId || undefined }
-          : false,
-        video: choices.videoEnabled
-          ? { deviceId: choices.videoDeviceId || undefined }
-          : false,
-        speakerDeviceId,
-      })
-    } catch (caught) {
-      // Network failures / CORS problems land here.
-      setError(
-        caught instanceof Error && caught.message
-          ? caught.message
-          : 'Could not reach the token endpoint.',
-      )
-    } finally {
-      setRequesting(false)
+    if (!details) {
+      return
     }
+
+    // Devices the user disabled are passed as `false`, so they are not
+    // requested when the room connects.
+    joinedRef.current = false
+    setSettings({
+      audio: choices.audioEnabled
+        ? { deviceId: choices.audioDeviceId || undefined }
+        : false,
+      video: choices.videoEnabled
+        ? { deviceId: choices.videoDeviceId || undefined }
+        : false,
+      speakerDeviceId,
+    })
   }
 
   function handleConnected() {
@@ -323,10 +222,18 @@ export default function Room() {
   }
 
   function handleDisconnected() {
-    // Back to the pre-join state on the same route; the existing `error` (if
-    // any) is left untouched so a connection failure stays visible.
+    // Read before clearing: `onDisconnected` also fires when a *failed*
+    // connection unmounts the room, and then we must not navigate away.
+    const wasJoined = joinedRef.current
+
     joinedRef.current = false
-    setConnection(null)
+    setSettings(null)
+    resetToken()
+
+    if (wasJoined) {
+      // Left the call (control bar "Leave" or remote end): back to dashboard.
+      navigate('/dashboard')
+    }
   }
 
   function handleLiveKitError(liveKitError: unknown) {
@@ -342,19 +249,20 @@ export default function Room() {
 
     // The connection itself failed — go back to the pre-join state.
     joinedRef.current = false
-    setConnection(null)
+    setSettings(null)
+    resetToken()
     setError(message)
   }
 
-  if (connection) {
+  if (settings && token) {
     return (
       <LiveKitRoom
-        token={connection.token}
-        serverUrl={connection.serverUrl}
+        token={token}
+        serverUrl={serverUrl}
         connect
         // Devices chosen on the pre-join screen; `false` keeps a device off.
-        audio={connection.audio}
-        video={connection.video}
+        audio={settings.audio}
+        video={settings.video}
         data-lk-theme="default"
         style={{ height: '100vh' }}
         onConnected={handleConnected}
@@ -363,7 +271,7 @@ export default function Room() {
       >
         <VideoConference />
         <RoomAudioRenderer />
-        <SpeakerSwitch deviceId={connection.speakerDeviceId} />
+        <SpeakerSwitch deviceId={settings.speakerDeviceId} />
 
         {error && (
           <p role="alert" style={roomErrorBanner}>
@@ -387,7 +295,7 @@ export default function Room() {
           Signed in as <strong>{displayName}</strong>
         </p>
 
-        {requesting ? (
+        {loading ? (
           <p role="status" style={muted}>
             Joining the room…
           </p>
@@ -444,9 +352,9 @@ export default function Room() {
           </p>
         )}
 
-        {error && (
+        {(tokenError ?? error) && (
           <p role="alert" style={errorText}>
-            {error}
+            {tokenError ?? error}
           </p>
         )}
 
