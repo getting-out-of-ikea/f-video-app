@@ -1,0 +1,20 @@
+# Aider
+.aider*
+
+# Environment variables
+.env.local
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Supabase Edge Function secrets
+supabase/functions/.env
+
+# Supabase CLI temporary files
+supabase/.temp/
