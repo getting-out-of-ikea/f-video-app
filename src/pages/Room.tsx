@@ -1,28 +1,34 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
+import type { User } from '@supabase/supabase-js'
 import {
   LiveKitRoom,
+  PreJoin,
   RoomAudioRenderer,
   VideoConference,
+  useMediaDevices,
+  useRoomContext,
 } from '@livekit/components-react'
 
 import '@livekit/components-styles'
+import { useAuth } from '../contexts/AuthContext'
 import { supabase } from '../lib/supabase'
 
 /**
- * Room page — first real LiveKit connection (piano.md §2.3, step 2.3).
+ * Room page — pre-join screen + LiveKit connection (piano.md §2.3 / §2.4).
  *
- * Joining is always explicit: loading the page requests nothing and connects
- * nothing. Clicking "Partecipa" asks the `livekit-token` Edge Function for a
- * token for the room id taken from the URL (`/room/:id`); only after a token
- * has been received is `<LiveKitRoom connect>` mounted, using
- * `VITE_LIVEKIT_URL` as the server URL.
+ * Opening `/room/:id` shows a *pre-join* screen (`<PreJoin>`): local camera
+ * preview, camera/microphone on-off toggles and device pickers, plus a speaker
+ * picker. Nothing is requested from the network and no room is connected
+ * during that stage — the LiveKit token is only asked for when the user
+ * presses "Partecipa ora".
  *
- * Camera and microphone are *not* requested on join (`audio`/`video` are
- * `false`): the user connects to the room first and then enables the devices
- * from the LiveKit control bar. A device that is busy or whose permission is
- * denied therefore never kicks the user out of the room.
+ * The pre-join choices are then applied to `<LiveKitRoom audio video>`: the
+ * selected device ids are used as capture options, and a device the user
+ * turned off is passed as `false` so it is not activated on join. A device
+ * that turns out to be busy/denied while joining no longer aborts the
+ * connection (see `handleLiveKitError`).
  *
  * Leaving the room (control bar) or a failed connection unmounts
  * `<LiveKitRoom>` — which disconnects the client — and returns to the pre-join
@@ -51,7 +57,7 @@ const page: CSSProperties = {
 
 const card: CSSProperties = {
   width: '100%',
-  maxWidth: '28rem',
+  maxWidth: '32rem',
   display: 'flex',
   flexDirection: 'column',
   gap: '0.75rem',
@@ -65,6 +71,11 @@ const muted: CSSProperties = {
 const errorText: CSSProperties = {
   color: '#b91c1c',
   fontSize: '0.875rem',
+}
+
+const cancelButton: CSSProperties = {
+  alignSelf: 'flex-start',
+  marginTop: '0.25rem',
 }
 
 /**
@@ -86,10 +97,43 @@ const roomErrorBanner: CSSProperties = {
   fontSize: '0.875rem',
 }
 
+/** The values the pre-join screen hands over when "Partecipa ora" is pressed. */
+interface JoinChoices {
+  audioEnabled: boolean
+  videoEnabled: boolean
+  audioDeviceId?: string
+  videoDeviceId?: string
+}
+
 interface Connection {
   /** Short-lived LiveKit access token. Never displayed. */
   token: string
   serverUrl: string
+  /** Capture options chosen on the pre-join screen (`false` = device off). */
+  audio: { deviceId?: string } | false
+  video: { deviceId?: string } | false
+  /** Speaker chosen on the pre-join screen (best effort). */
+  speakerDeviceId: string
+}
+
+/**
+ * Read a human-readable display name from the Supabase user: explicit display
+ * name first, then full name / name, and finally the email local-part.
+ */
+function readDisplayName(user: User | null): string {
+  const metadata: Record<string, unknown> = user?.user_metadata ?? {}
+
+  for (const key of ['display_name', 'full_name', 'name']) {
+    const value = metadata[key]
+
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim()
+    }
+  }
+
+  const email = user?.email?.trim() ?? ''
+
+  return email ? email.split('@')[0] : 'Ospite'
 }
 
 /**
@@ -160,12 +204,43 @@ function describeLiveKitError(error: unknown): string {
     : 'Could not connect to the room.'
 }
 
+/**
+ * Applies the speaker selected on the pre-join screen once the room exists.
+ * Switching the audio output device is best effort: not every browser supports
+ * `setSinkId`, so failures are ignored.
+ */
+function SpeakerSwitch({ deviceId }: { deviceId: string }) {
+  const room = useRoomContext()
+
+  useEffect(() => {
+    if (!deviceId) {
+      return
+    }
+
+    void room.switchActiveDevice('audiooutput', deviceId).catch(() => {
+      // Ignored: output selection is a nice-to-have.
+    })
+  }, [room, deviceId])
+
+  return null
+}
+
 export default function Room() {
   const { id } = useParams<{ id: string }>()
 
   // The route param is the single source of truth for the room to join.
   const roomName = (id ?? '').trim()
 
+  const navigate = useNavigate()
+  const { user } = useAuth()
+  const displayName = readDisplayName(user)
+
+  // Speaker picker for the pre-join screen. Camera and microphone devices are
+  // chosen with the selectors built into <PreJoin>.
+  const speakerDevices = useMediaDevices({ kind: 'audiooutput' })
+  const [speakerDeviceId, setSpeakerDeviceId] = useState('')
+
+  const [previewError, setPreviewError] = useState<string | null>(null)
   const [connection, setConnection] = useState<Connection | null>(null)
   const [requesting, setRequesting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -175,7 +250,12 @@ export default function Room() {
   // `true` once the room is actually connected.
   const joinedRef = useRef(false)
 
-  async function handleJoin() {
+  /**
+   * Runs only when the user presses "Partecipa ora" on the pre-join screen:
+   * asks the Edge Function for a token and mounts `<LiveKitRoom>` with the
+   * device choices made on that screen.
+   */
+  async function handleJoin(choices: JoinChoices) {
     if (!roomName) {
       setError('The room id is missing from the URL.')
       return
@@ -189,6 +269,7 @@ export default function Room() {
     }
 
     setError(null)
+    setPreviewError(null)
     setRequesting(true)
 
     try {
@@ -211,9 +292,20 @@ export default function Room() {
         return
       }
 
-      // Rendering `<LiveKitRoom connect>` is what actually connects.
+      // Rendering `<LiveKitRoom connect>` is what actually connects. Devices
+      // the user disabled are passed as `false`, so they are not requested.
       joinedRef.current = false
-      setConnection({ token, serverUrl: liveKitServerUrl })
+      setConnection({
+        token,
+        serverUrl: liveKitServerUrl,
+        audio: choices.audioEnabled
+          ? { deviceId: choices.audioDeviceId || undefined }
+          : false,
+        video: choices.videoEnabled
+          ? { deviceId: choices.videoDeviceId || undefined }
+          : false,
+        speakerDeviceId,
+      })
     } catch (caught) {
       // Network failures / CORS problems land here.
       setError(
@@ -260,11 +352,9 @@ export default function Room() {
         token={connection.token}
         serverUrl={connection.serverUrl}
         connect
-        // Do not request camera/microphone while joining: the devices are
-        // enabled on demand from the control bar, so a busy or denied device
-        // can never abort the connection.
-        audio={false}
-        video={false}
+        // Devices chosen on the pre-join screen; `false` keeps a device off.
+        audio={connection.audio}
+        video={connection.video}
         data-lk-theme="default"
         style={{ height: '100vh' }}
         onConnected={handleConnected}
@@ -273,6 +363,7 @@ export default function Room() {
       >
         <VideoConference />
         <RoomAudioRenderer />
+        <SpeakerSwitch deviceId={connection.speakerDeviceId} />
 
         {error && (
           <p role="alert" style={roomErrorBanner}>
@@ -293,22 +384,63 @@ export default function Room() {
         </p>
 
         <p style={muted}>
-          Join the room to start the call. Camera and microphone stay off until
-          you turn them on from the control bar.
+          Signed in as <strong>{displayName}</strong>
         </p>
 
-        <button
-          type="button"
-          onClick={handleJoin}
-          disabled={requesting || !roomName || !liveKitServerUrl}
-          style={{ alignSelf: 'flex-start' }}
-        >
-          {requesting ? 'Connecting…' : 'Partecipa'}
-        </button>
-
-        {requesting && (
+        {requesting ? (
           <p role="status" style={muted}>
-            Requesting a room token…
+            Joining the room…
+          </p>
+        ) : (
+          <>
+            <p style={muted}>
+              Check your camera and microphone, then join. Nothing is sent until
+              you press “Partecipa ora”.
+            </p>
+
+            <PreJoin
+              defaults={{
+                username: displayName,
+                videoEnabled: true,
+                audioEnabled: true,
+              }}
+              joinLabel="Partecipa ora"
+              userLabel="Nome"
+              camLabel="Fotocamera"
+              micLabel="Microfono"
+              onSubmit={(values) => {
+                void handleJoin(values)
+              }}
+              onError={(caught) => {
+                // Device busy / permission denied in the preview: the user can
+                // still turn the device off below and join.
+                setPreviewError(describeLiveKitError(caught))
+              }}
+            />
+
+            {speakerDevices.length > 0 && (
+              <label style={muted}>
+                Altoparlante
+                <select
+                  value={speakerDeviceId}
+                  onChange={(event) => setSpeakerDeviceId(event.target.value)}
+                  style={{ display: 'block', width: '100%', marginTop: '0.25rem' }}
+                >
+                  <option value="">Predefinito</option>
+                  {speakerDevices.map((device, index) => (
+                    <option key={device.deviceId} value={device.deviceId}>
+                      {device.label || `Altoparlante ${index + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+          </>
+        )}
+
+        {previewError && (
+          <p role="alert" style={errorText}>
+            {previewError} You can turn the device off and still join.
           </p>
         )}
 
@@ -318,9 +450,13 @@ export default function Room() {
           </p>
         )}
 
-        <p>
-          <Link to="/dashboard">Back to dashboard</Link>
-        </p>
+        <button
+          type="button"
+          onClick={() => navigate('/dashboard')}
+          style={cancelButton}
+        >
+          Cancel
+        </button>
       </div>
     </main>
   )
