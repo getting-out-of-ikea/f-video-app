@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import {
@@ -19,9 +19,15 @@ import { supabase } from '../lib/supabase'
  * has been received is `<LiveKitRoom connect>` mounted, using
  * `VITE_LIVEKIT_URL` as the server URL.
  *
- * Leaving the room (control bar) or a connection error unmounts `<LiveKitRoom>`
- * — which disconnects the client — and returns to the pre-join state on the
- * same route.
+ * Camera and microphone are *not* requested on join (`audio`/`video` are
+ * `false`): the user connects to the room first and then enables the devices
+ * from the LiveKit control bar. A device that is busy or whose permission is
+ * denied therefore never kicks the user out of the room.
+ *
+ * Leaving the room (control bar) or a failed connection unmounts
+ * `<LiveKitRoom>` — which disconnects the client — and returns to the pre-join
+ * state on the same route. Errors that happen *after* the room is connected
+ * (typically media/device errors) are only reported and keep the call alive.
  *
  * The token lives in component state only: it is never rendered, never logged
  * and never included in an error message. The LiveKit API key/secret stay in
@@ -57,6 +63,25 @@ const muted: CSSProperties = {
 }
 
 const errorText: CSSProperties = {
+  color: '#b91c1c',
+  fontSize: '0.875rem',
+}
+
+/**
+ * In-room error banner: shown on top of the call, so a failed device
+ * activation is visible without disconnecting the user.
+ */
+const roomErrorBanner: CSSProperties = {
+  position: 'fixed',
+  bottom: '6rem',
+  left: '50%',
+  transform: 'translateX(-50%)',
+  zIndex: 10,
+  maxWidth: '32rem',
+  margin: 0,
+  padding: '0.5rem 0.75rem',
+  borderRadius: '0.375rem',
+  background: '#fee2e2',
   color: '#b91c1c',
   fontSize: '0.875rem',
 }
@@ -129,6 +154,12 @@ async function describeFunctionError(error: unknown): Promise<string> {
   return `Request failed with HTTP ${status}.`
 }
 
+function describeLiveKitError(error: unknown): string {
+  return error instanceof Error && error.message
+    ? error.message
+    : 'Could not connect to the room.'
+}
+
 export default function Room() {
   const { id } = useParams<{ id: string }>()
 
@@ -138,6 +169,11 @@ export default function Room() {
   const [connection, setConnection] = useState<Connection | null>(null)
   const [requesting, setRequesting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  // Kept in a ref (not state) so the `onError` / `onDisconnected` handlers
+  // always read the current value, even if LiveKit captured them earlier.
+  // `true` once the room is actually connected.
+  const joinedRef = useRef(false)
 
   async function handleJoin() {
     if (!roomName) {
@@ -176,6 +212,7 @@ export default function Room() {
       }
 
       // Rendering `<LiveKitRoom connect>` is what actually connects.
+      joinedRef.current = false
       setConnection({ token, serverUrl: liveKitServerUrl })
     } catch (caught) {
       // Network failures / CORS problems land here.
@@ -189,19 +226,32 @@ export default function Room() {
     }
   }
 
+  function handleConnected() {
+    joinedRef.current = true
+  }
+
   function handleDisconnected() {
     // Back to the pre-join state on the same route; the existing `error` (if
     // any) is left untouched so a connection failure stays visible.
+    joinedRef.current = false
     setConnection(null)
   }
 
   function handleLiveKitError(liveKitError: unknown) {
+    const message = describeLiveKitError(liveKitError)
+
+    if (joinedRef.current) {
+      // Media/device error (camera busy, permission denied, publish failure)
+      // after the room was joined: report it, but stay in the call. The user
+      // can retry from the control bar.
+      setError(message)
+      return
+    }
+
+    // The connection itself failed — go back to the pre-join state.
+    joinedRef.current = false
     setConnection(null)
-    setError(
-      liveKitError instanceof Error && liveKitError.message
-        ? liveKitError.message
-        : 'Could not connect to the room.',
-    )
+    setError(message)
   }
 
   if (connection) {
@@ -210,15 +260,25 @@ export default function Room() {
         token={connection.token}
         serverUrl={connection.serverUrl}
         connect
-        audio
-        video
+        // Do not request camera/microphone while joining: the devices are
+        // enabled on demand from the control bar, so a busy or denied device
+        // can never abort the connection.
+        audio={false}
+        video={false}
         data-lk-theme="default"
         style={{ height: '100vh' }}
+        onConnected={handleConnected}
         onDisconnected={handleDisconnected}
         onError={handleLiveKitError}
       >
         <VideoConference />
         <RoomAudioRenderer />
+
+        {error && (
+          <p role="alert" style={roomErrorBanner}>
+            {error}
+          </p>
+        )}
       </LiveKitRoom>
     )
   }
@@ -233,8 +293,8 @@ export default function Room() {
         </p>
 
         <p style={muted}>
-          Join the room to start the call. Camera and microphone are enabled
-          when you join; the device selection screen comes in a later step.
+          Join the room to start the call. Camera and microphone stay off until
+          you turn them on from the control bar.
         </p>
 
         <button
