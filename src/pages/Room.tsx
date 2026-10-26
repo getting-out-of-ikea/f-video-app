@@ -10,7 +10,6 @@ import {
   useMediaDevices,
   useRoomContext,
 } from '@livekit/components-react'
-import { RoomEvent } from 'livekit-client'
 
 import '@livekit/components-styles'
 import { useAuth } from '../contexts/AuthContext'
@@ -37,9 +36,12 @@ import { useLiveKitToken } from '../hooks/useLiveKitToken'
  * pre-join screen, can retry by toggling the device (see `<PreJoin>`) and can
  * always join with the failing device switched off.
  *
- * Remote audio blocked by the browser autoplay policy is surfaced by
- * `<EnableAudioButton />` (§2.7 requirement 3), which stays hidden while audio
- * plays normally.
+ * Remote audio blocked by the browser autoplay policy (§2.7 requirement 3) is
+ * handled by LiveKit's own `StartAudio` control, which `<VideoConference />`
+ * renders in its control bar while `room.canPlaybackAudio` is `false`. It shows
+ * itself only when playback is actually blocked, resumes playback through
+ * `room.startAudio()` on click and disappears once audio plays, so the app
+ * deliberately does not add a second "enable audio" button.
  *
  * Leaving the room (control bar "Leave", or a remote end) navigates back to the
  * dashboard; a *failed* connection instead returns to the pre-join state on the
@@ -96,18 +98,6 @@ const roomErrorBanner: CSSProperties = {
   background: '#fee2e2',
   color: '#b91c1c',
   fontSize: '0.875rem',
-}
-
-/**
- * Container for the "Enable audio" prompt: pinned near the top of the call so
- * it is visible without covering the control bar or the error banner.
- */
-const enableAudioContainer: CSSProperties = {
-  position: 'fixed',
-  top: '1rem',
-  left: '50%',
-  transform: 'translateX(-50%)',
-  zIndex: 10,
 }
 
 /** The values the pre-join screen hands over when "Partecipa ora" is pressed. */
@@ -233,69 +223,6 @@ function describeMediaError(error: unknown): string {
   }
 
   return `${describeLiveKitError(error)} Check the device and your browser permissions, then switch the device off and on again on this screen to retry. You can also join with it switched off.`
-}
-
-/**
- * "Enable audio" prompt for remote audio blocked by the browser autoplay policy
- * (piano.md §2.7 requirement 3).
- *
- * `<RoomAudioRenderer />` keeps the remote audio tracks attached; when the
- * browser refuses to play them the room reports it through
- * `room.canPlaybackAudio` and raises `RoomEvent.AudioPlaybackStatusChanged`.
- * `room.startAudio()` resumes playback and, because it runs inside a click,
- * satisfies the autoplay policy.
- *
- * The button renders only while playback is blocked, and hides itself again as
- * soon as the room reports that audio is playing.
- */
-function EnableAudioButton() {
-  const room = useRoomContext()
-
-  // The initial value comes from the room itself; it is only `false` once the
-  // browser has actually blocked a track, so a normal call never shows this.
-  const [canPlayAudio, setCanPlayAudio] = useState(room.canPlaybackAudio)
-  const [starting, setStarting] = useState(false)
-
-  useEffect(() => {
-    const handlePlaybackStatusChanged = () => {
-      setCanPlayAudio(room.canPlaybackAudio)
-    }
-
-    room.on(RoomEvent.AudioPlaybackStatusChanged, handlePlaybackStatusChanged)
-
-    // Pick up a status change that happened before the listener was attached.
-    handlePlaybackStatusChanged()
-
-    return () => {
-      room.off(RoomEvent.AudioPlaybackStatusChanged, handlePlaybackStatusChanged)
-    }
-  }, [room])
-
-  async function handleEnableAudio() {
-    setStarting(true)
-
-    try {
-      // Must run from a user gesture — this is the gesture.
-      await room.startAudio()
-    } catch {
-      // Still blocked (the gesture may not have been accepted): the button
-      // stays visible so the user can try again.
-    } finally {
-      setStarting(false)
-    }
-  }
-
-  if (canPlayAudio) {
-    return null
-  }
-
-  return (
-    <div style={enableAudioContainer}>
-      <button type="button" onClick={handleEnableAudio} disabled={starting}>
-        {starting ? 'Enabling audio…' : 'Enable audio'}
-      </button>
-    </div>
-  )
 }
 
 /**
@@ -439,7 +366,6 @@ export default function Room() {
         <VideoConference />
         <RoomAudioRenderer />
         <SpeakerSwitch deviceId={settings.speakerDeviceId} />
-        <EnableAudioButton />
 
         {error && (
           <p role="alert" style={roomErrorBanner}>
