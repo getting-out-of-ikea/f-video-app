@@ -17,7 +17,7 @@ import { useLiveKitToken } from '../hooks/useLiveKitToken'
 
 /**
  * Room page — pre-join screen + LiveKit connection (piano.md §2.3 / §2.4 /
- * §2.5).
+ * §2.5 / §2.7).
  *
  * Opening `/room/:id` shows a *pre-join* screen (`<PreJoin>`): local camera
  * preview, camera/microphone on-off toggles and device pickers, plus a speaker
@@ -30,6 +30,11 @@ import { useLiveKitToken } from '../hooks/useLiveKitToken'
  * turned off is passed as `false` so it is not activated on join. A device
  * that turns out to be busy/denied while joining no longer aborts the
  * connection (see `handleLiveKitError`).
+ *
+ * Camera/microphone failures on the pre-join screen are translated into
+ * friendly, actionable messages (§2.7 requirement 2): the user stays on the
+ * pre-join screen, can retry by toggling the device (see `<PreJoin>`) and can
+ * always join with the failing device switched off.
  *
  * Leaving the room (control bar "Leave", or a remote end) navigates back to the
  * dashboard; a *failed* connection instead returns to the pre-join state on the
@@ -129,6 +134,88 @@ function describeLiveKitError(error: unknown): string {
   return error instanceof Error && error.message
     ? error.message
     : 'Could not connect to the room.'
+}
+
+/**
+ * The kinds of camera/microphone failure the pre-join screen can explain
+ * (piano.md §2.7 requirement 2).
+ */
+type MediaIssueKind = 'permission-denied' | 'device-not-found' | 'device-busy' | 'unknown'
+
+/**
+ * Error names that map to each kind. Browsers report media failures through
+ * `DOMException` names; LiveKit may wrap the original error and expose its own
+ * `MediaDeviceFailure` values ("PermissionDenied", "NotFound", "DeviceInUse").
+ * Both spellings are listed so the classification works either way.
+ */
+const MEDIA_ISSUE_HINTS: Record<Exclude<MediaIssueKind, 'unknown'>, string[]> = {
+  'permission-denied': [
+    'NotAllowedError',
+    'PermissionDeniedError',
+    'SecurityError',
+    'PermissionDenied',
+  ],
+  'device-not-found': [
+    'NotFoundError',
+    'DevicesNotFoundError',
+    'OverconstrainedError',
+    'NotFound',
+  ],
+  'device-busy': ['NotReadableError', 'TrackStartError', 'AbortError', 'DeviceInUse'],
+}
+
+/**
+ * Friendly, actionable message per failure kind. Every message ends with the
+ * two things the user can do on this screen: retry by toggling the device, or
+ * join without it.
+ */
+const MEDIA_ISSUE_MESSAGES: Record<Exclude<MediaIssueKind, 'unknown'>, string> = {
+  'permission-denied':
+    'Camera or microphone access is blocked. Allow it for this site in your browser (padlock icon in the address bar → Site settings), then switch the device off and on again on this screen to retry. You can also join with it switched off.',
+  'device-not-found':
+    'No camera or microphone was found. Connect one, or enable it in your system settings, then switch the device off and on again on this screen to retry. You can also join with it switched off.',
+  'device-busy':
+    'Your camera or microphone looks busy: another application or browser tab may be using it. Close it, then switch the device off and on again on this screen to retry. You can also join with it switched off.',
+}
+
+/** Classify a media error reported by `<PreJoin>`. */
+function classifyMediaError(error: unknown): MediaIssueKind {
+  const candidate = (error ?? null) as { name?: unknown; failure?: unknown } | null
+
+  const hints: string[] = []
+
+  if (candidate) {
+    for (const value of [candidate.name, candidate.failure]) {
+      if (typeof value === 'string' && value.trim()) {
+        hints.push(value.trim().toLowerCase())
+      }
+    }
+  }
+
+  for (const [kind, names] of Object.entries(MEDIA_ISSUE_HINTS) as Array<
+    [Exclude<MediaIssueKind, 'unknown'>, string[]]
+  >) {
+    if (names.some((name) => hints.includes(name.toLowerCase()))) {
+      return kind
+    }
+  }
+
+  return 'unknown'
+}
+
+/**
+ * Turn a pre-join media error into a message that explains the cause and what
+ * the user can do about it. Unknown errors keep the original message and get
+ * the same retry/join-without-it guidance appended.
+ */
+function describeMediaError(error: unknown): string {
+  const kind = classifyMediaError(error)
+
+  if (kind !== 'unknown') {
+    return MEDIA_ISSUE_MESSAGES[kind]
+  }
+
+  return `${describeLiveKitError(error)} Check the device and your browser permissions, then switch the device off and on again on this screen to retry. You can also join with it switched off.`
 }
 
 /**
@@ -320,9 +407,10 @@ export default function Room() {
                 void handleJoin(values)
               }}
               onError={(caught) => {
-                // Device busy / permission denied in the preview: the user can
-                // still turn the device off below and join.
-                setPreviewError(describeLiveKitError(caught))
+                // Permission denied / no device / device busy: explain the
+                // cause and how to retry. The user stays on this screen and can
+                // also join with the failing device switched off.
+                setPreviewError(describeMediaError(caught))
               }}
             />
 
@@ -348,7 +436,7 @@ export default function Room() {
 
         {previewError && (
           <p role="alert" style={errorText}>
-            {previewError} You can turn the device off and still join.
+            {previewError}
           </p>
         )}
 
