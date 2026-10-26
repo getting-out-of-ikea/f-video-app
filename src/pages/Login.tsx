@@ -1,6 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { CSSProperties, FormEvent } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { useAuth } from '../contexts/AuthContext'
+import { readAuthRedirect, withRedirectSuffix } from '../lib/authRedirect'
 import { supabase } from '../lib/supabase'
 
 const page: CSSProperties = {
@@ -38,21 +40,45 @@ const muted: CSSProperties = {
  * Login page (piano.md §1.5, "Login page"), without the password-reset link,
  * which is not part of this step.
  *
- * On success the page navigates to `/dashboard`. `AuthContext` has already
- * received the session through `onAuthStateChange`, so `ProtectedRoute` sees
- * the signed-in user as soon as the route changes; `replace` keeps the login
- * form out of the history stack, so Back from the dashboard does not return
- * to it.
+ * Destination: a user sent here by `<ProtectedRoute>` carries the attempted
+ * URL in router state (`state.from`), so a meeting invitation that redirected
+ * to `/login` comes back to `/room/<id>` afterwards — and only as far as the
+ * pre-join screen, because `<Room>` does not request a token until the user
+ * presses "Partecipa ora". The same target is forwarded to the signup link and
+ * accepted from a `?redirect=` query parameter, so it also survives the
+ * Login ↔ Signup switch and the email-confirmation round trip. With no target
+ * the user lands on `/dashboard`.
+ *
+ * `AuthContext` keeps `user` in sync through `onAuthStateChange`; the effect
+ * below covers the case where the user is already signed in on arrival (the
+ * email-confirmation link, where `supabase-js` exchanges the URL tokens for a
+ * session on load). `replace` keeps the auth form out of the history stack, so
+ * Back from the destination does not return to it.
  *
  * A failed sign-in keeps the user on this page and shows the existing error.
  */
 export default function Login() {
   const navigate = useNavigate()
+  const location = useLocation()
+  const { user, loading: authLoading } = useAuth()
+
+  // Where to go after authenticating (meeting link, or /dashboard by default).
+  const redirectTarget = readAuthRedirect(location.state, location.search)
 
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  // Already signed in on arrival — typically after clicking the confirmation
+  // link in the signup email: `supabase-js` has exchanged the URL tokens for a
+  // session, so forward to the intended destination instead of showing the
+  // form again.
+  useEffect(() => {
+    if (!authLoading && user) {
+      navigate(redirectTarget, { replace: true })
+    }
+  }, [authLoading, user, navigate, redirectTarget])
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -81,7 +107,7 @@ export default function Login() {
 
       // Success: hand over to the protected area. `replace` avoids leaving the
       // login form in the history stack.
-      navigate('/dashboard', { replace: true })
+      navigate(redirectTarget, { replace: true })
     } catch (err) {
       setError(
         err instanceof Error ? err.message : 'Unexpected error. Please try again.',
@@ -133,7 +159,8 @@ export default function Login() {
         </button>
 
         <p style={muted}>
-          No account yet? <Link to="/signup">Sign up</Link>
+          No account yet?{' '}
+          <Link to={withRedirectSuffix('/signup', redirectTarget)}>Sign up</Link>
         </p>
       </form>
     </main>
