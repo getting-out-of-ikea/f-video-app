@@ -45,9 +45,15 @@ import { useLiveKitToken } from '../hooks/useLiveKitToken'
  *
  * Once connected, a slim meeting header shows the room id and a "Copy link"
  * action that copies `/room/<roomId>` on the current origin, so a second
- * participant can be invited. The header sits in a flex column above
- * `<LiveKitRoom>`: it has a fixed height and the call takes the rest of
- * `100vh`, so the room never scrolls.
+ * participant can be invited.
+ *
+ * Layout: header + video area + control bar must fit the visible viewport with
+ * no page scrolling. The shell is a flex column sized to the viewport
+ * (`100vh` clamped by `maxHeight: 100dvh`, so mobile browser chrome is
+ * accounted for), the header is `flex: 0 0 auto`, and the call area is
+ * `flex: 1 1 0; min-height: 0` so the video shrinks into the remaining height
+ * instead of growing the page. LiveKit's own `.lk-room-container { height: 100% }`
+ * is neutralised with an inline `height: auto` so the flex basis decides.
  *
  * Leaving the room (control bar "Leave", or a remote end) navigates back to the
  * dashboard; a *failed* connection instead returns to the pre-join state on the
@@ -88,12 +94,22 @@ const cancelButton: CSSProperties = {
 }
 
 /**
- * Shell for the connected room: header on top, call below. `overflow: hidden`
- * plus `boxSizing: border-box` keep the two together at exactly `100vh`, so the
- * header can never introduce page scrolling.
+ * Shell for the connected room: header on top, call below, both inside the
+ * visible viewport.
+ *
+ * `height: 100vh` with `maxHeight: 100dvh` is the dynamic-viewport combination:
+ * desktop browsers resolve both to the viewport height, mobile browsers clamp
+ * the (too tall) `vh` value to the *visible* viewport so the control bar is not
+ * pushed under the browser's address bar, and older browsers that do not know
+ * `dvh` simply keep the `vh` behaviour.
+ *
+ * `overflow: hidden` is only a sub-pixel guard and never clips the control bar:
+ * the call area below is *sized* by flex, not cropped. `boxSizing` keeps any
+ * future padding inside the viewport height.
  */
 const meetingShell: CSSProperties = {
   height: '100vh',
+  maxHeight: '100dvh',
   display: 'flex',
   flexDirection: 'column',
   overflow: 'hidden',
@@ -101,11 +117,11 @@ const meetingShell: CSSProperties = {
 }
 
 /**
- * Slim meeting header. Fixed (small) height so it takes nothing meaningful away
- * from the video area.
+ * Slim meeting header: fixed (small) height, so it takes nothing meaningful away
+ * from the video area and never shrinks.
  */
 const meetingHeader: CSSProperties = {
-  flexShrink: 0,
+  flex: '0 0 auto',
   display: 'flex',
   alignItems: 'center',
   gap: '0.75rem',
@@ -502,7 +518,11 @@ export default function Room() {
           audio={settings.audio}
           video={settings.video}
           data-lk-theme="default"
-          style={{ flex: 1, minHeight: 0 }}
+          // Take the height left under the header and be allowed to shrink:
+          // `flex-basis: 0` + `minHeight: 0` are what keep the control bar
+          // inside the viewport. `height: auto` overrides LiveKit's own
+          // `.lk-room-container { height: 100% }` so the flex basis decides.
+          style={{ flex: '1 1 0', minHeight: 0, height: 'auto', width: '100%' }}
           onConnected={handleConnected}
           onDisconnected={handleDisconnected}
           onError={handleLiveKitError}

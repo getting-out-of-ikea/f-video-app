@@ -17,16 +17,28 @@
   box-sizing: border-box;
 }
 
+/* The application owns the viewport height: html → body → #root form a
+   definite height chain, so a page can fill the visible viewport instead of
+   overflowing it. Percentages below (e.g. a full-height page) need this
+   definite height to resolve.
+
+   Previously `body` was a centring flex container with `min-height: 100vh`
+   and `#root` carried `padding: 2rem`. A 100vh page (the meeting room) lived
+   inside that padded box, so the document became 100vh + 4rem tall; the
+   centring split the overflow above and below the fold, which pushed the
+   bottom control bar out of the viewport. */
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* No centring and no padding: every page centres its own content, and the
+   meeting room needs the full width and height of the viewport. */
 body {
   margin: 0;
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
 }
 
 #root {
   width: 100%;
-  max-width: 960px;
-  padding: 2rem;
 }
