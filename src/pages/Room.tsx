@@ -43,6 +43,12 @@ import { useLiveKitToken } from '../hooks/useLiveKitToken'
  * `room.startAudio()` on click and disappears once audio plays, so the app
  * deliberately does not add a second "enable audio" button.
  *
+ * Once connected, a slim meeting header shows the room id and a "Copy link"
+ * action that copies `/room/<roomId>` on the current origin, so a second
+ * participant can be invited. The header sits in a flex column above
+ * `<LiveKitRoom>`: it has a fixed height and the call takes the rest of
+ * `100vh`, so the room never scrolls.
+ *
  * Leaving the room (control bar "Leave", or a remote end) navigates back to the
  * dashboard; a *failed* connection instead returns to the pre-join state on the
  * same route so the error stays visible. Errors that happen *after* the room is
@@ -82,6 +88,64 @@ const cancelButton: CSSProperties = {
 }
 
 /**
+ * Shell for the connected room: header on top, call below. `overflow: hidden`
+ * plus `boxSizing: border-box` keep the two together at exactly `100vh`, so the
+ * header can never introduce page scrolling.
+ */
+const meetingShell: CSSProperties = {
+  height: '100vh',
+  display: 'flex',
+  flexDirection: 'column',
+  overflow: 'hidden',
+  boxSizing: 'border-box',
+}
+
+/**
+ * Slim meeting header. Fixed (small) height so it takes nothing meaningful away
+ * from the video area.
+ */
+const meetingHeader: CSSProperties = {
+  flexShrink: 0,
+  display: 'flex',
+  alignItems: 'center',
+  gap: '0.75rem',
+  padding: '0.375rem 0.75rem',
+  borderBottom: '1px solid #e5e7eb',
+  background: '#fafafa',
+  fontSize: '0.8125rem',
+  lineHeight: 1.25,
+}
+
+const roomLabel: CSSProperties = {
+  display: 'flex',
+  alignItems: 'baseline',
+  gap: '0.375rem',
+  minWidth: 0,
+  color: '#555',
+}
+
+const roomIdText: CSSProperties = {
+  color: '#111',
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  maxWidth: '20rem',
+}
+
+const copyButton: CSSProperties = {
+  flexShrink: 0,
+  padding: '0.125rem 0.5rem',
+  font: 'inherit',
+  cursor: 'pointer',
+}
+
+const copyFeedback: CSSProperties = {
+  flexShrink: 0,
+  color: '#b91c1c',
+}
+
+/**
  * In-room error banner: shown on top of the call, so a failed device
  * activation is visible without disconnecting the user.
  */
@@ -100,6 +164,9 @@ const roomErrorBanner: CSSProperties = {
   fontSize: '0.875rem',
 }
 
+/** How long the "Copied!" / copy-error feedback stays visible. */
+const COPY_FEEDBACK_MS = 2000
+
 /** The values the pre-join screen hands over when "Partecipa ora" is pressed. */
 interface JoinChoices {
   audioEnabled: boolean
@@ -116,6 +183,9 @@ interface JoinSettings {
   /** Speaker chosen on the pre-join screen (best effort). */
   speakerDeviceId: string
 }
+
+/** Outcome of the last "Copy link" click. */
+type CopyStatus = 'idle' | 'copied' | 'error'
 
 /**
  * Read a human-readable display name from the Supabase user: explicit display
@@ -276,10 +346,58 @@ export default function Room() {
   const [settings, setSettings] = useState<JoinSettings | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // "Copy link" feedback in the meeting header.
+  const [copyStatus, setCopyStatus] = useState<CopyStatus>('idle')
+  const copyTimeoutRef = useRef<number | null>(null)
+
   // Kept in a ref (not state) so the `onError` / `onDisconnected` handlers
   // always read the current value, even if LiveKit captured them earlier.
   // `true` once the room is actually connected.
   const joinedRef = useRef(false)
+
+  // Clear the pending "Copied!" timer when the page is left.
+  useEffect(() => {
+    return () => {
+      if (copyTimeoutRef.current !== null) {
+        window.clearTimeout(copyTimeoutRef.current)
+        copyTimeoutRef.current = null
+      }
+    }
+  }, [])
+
+  /** Show a copy result for a moment, then fall back to the idle label. */
+  function showCopyStatus(status: CopyStatus) {
+    if (copyTimeoutRef.current !== null) {
+      window.clearTimeout(copyTimeoutRef.current)
+    }
+
+    setCopyStatus(status)
+    copyTimeoutRef.current = window.setTimeout(() => {
+      copyTimeoutRef.current = null
+      setCopyStatus('idle')
+    }, COPY_FEEDBACK_MS)
+  }
+
+  /**
+   * Copy the invite link for this room. The URL is always built as
+   * `<origin>/room/<roomId>`, so a pasted link re-opens the same room (the
+   * route param stays the single source of truth).
+   */
+  async function handleCopyLink() {
+    const url = `${window.location.origin}/room/${encodeURIComponent(roomName)}`
+
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error('Clipboard API is not available.')
+      }
+
+      await navigator.clipboard.writeText(url)
+      showCopyStatus('copied')
+    } catch {
+      // Permission denied, insecure context, unsupported browser, …
+      showCopyStatus('error')
+    }
+  }
 
   /**
    * Runs only when the user presses "Partecipa ora" on the pre-join screen:
@@ -350,29 +468,56 @@ export default function Room() {
 
   if (settings && token) {
     return (
-      <LiveKitRoom
-        token={token}
-        serverUrl={serverUrl}
-        connect
-        // Devices chosen on the pre-join screen; `false` keeps a device off.
-        audio={settings.audio}
-        video={settings.video}
-        data-lk-theme="default"
-        style={{ height: '100vh' }}
-        onConnected={handleConnected}
-        onDisconnected={handleDisconnected}
-        onError={handleLiveKitError}
-      >
-        <VideoConference />
-        <RoomAudioRenderer />
-        <SpeakerSwitch deviceId={settings.speakerDeviceId} />
+      <div style={meetingShell}>
+        <header style={meetingHeader}>
+          <span style={roomLabel}>
+            Room
+            <strong style={roomIdText} title={roomName}>
+              {roomName || '(none)'}
+            </strong>
+          </span>
 
-        {error && (
-          <p role="alert" style={roomErrorBanner}>
-            {error}
-          </p>
-        )}
-      </LiveKitRoom>
+          <button
+            type="button"
+            onClick={() => {
+              void handleCopyLink()
+            }}
+            style={copyButton}
+          >
+            {copyStatus === 'copied' ? 'Copied!' : 'Copy link'}
+          </button>
+
+          {copyStatus === 'error' && (
+            <span role="status" style={copyFeedback}>
+              Could not copy — copy the URL from the address bar.
+            </span>
+          )}
+        </header>
+
+        <LiveKitRoom
+          token={token}
+          serverUrl={serverUrl}
+          connect
+          // Devices chosen on the pre-join screen; `false` keeps a device off.
+          audio={settings.audio}
+          video={settings.video}
+          data-lk-theme="default"
+          style={{ flex: 1, minHeight: 0 }}
+          onConnected={handleConnected}
+          onDisconnected={handleDisconnected}
+          onError={handleLiveKitError}
+        >
+          <VideoConference />
+          <RoomAudioRenderer />
+          <SpeakerSwitch deviceId={settings.speakerDeviceId} />
+
+          {error && (
+            <p role="alert" style={roomErrorBanner}>
+              {error}
+            </p>
+          )}
+        </LiveKitRoom>
+      </div>
     )
   }
 
