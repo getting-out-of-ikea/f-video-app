@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { CSSProperties, FormEvent } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 
 const page: CSSProperties = {
@@ -38,26 +38,31 @@ const muted: CSSProperties = {
  * Login page (piano.md §1.5, "Login page"), without the password-reset link,
  * which is not part of this step.
  *
- * On success the page only reports which account is signed in. Redirecting to
- * a dashboard needs the session-aware routing of §1.4 / §1.6.
+ * On success the page navigates to `/dashboard`. `AuthContext` has already
+ * received the session through `onAuthStateChange`, so `ProtectedRoute` sees
+ * the signed-in user as soon as the route changes; `replace` keeps the login
+ * form out of the history stack, so Back from the dashboard does not return
+ * to it.
+ *
+ * A failed sign-in keeps the user on this page and shows the existing error.
  */
 export default function Login() {
+  const navigate = useNavigate()
+
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [signedInEmail, setSignedInEmail] = useState<string | null>(null)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setError(null)
-    setSignedInEmail(null)
 
     const trimmedEmail = email.trim()
     setLoading(true)
 
     try {
-      const { data, error: signInError } =
+      const { error: signInError } =
         await supabase.auth.signInWithPassword({
           email: trimmedEmail,
           password,
@@ -74,8 +79,9 @@ export default function Login() {
         return
       }
 
-      setSignedInEmail(data.user?.email ?? trimmedEmail)
-      setPassword('')
+      // Success: hand over to the protected area. `replace` avoids leaving the
+      // login form in the history stack.
+      navigate('/dashboard', { replace: true })
     } catch (err) {
       setError(
         err instanceof Error ? err.message : 'Unexpected error. Please try again.',
@@ -119,13 +125,6 @@ export default function Login() {
         {error && (
           <p style={errorText} role="alert">
             {error}
-          </p>
-        )}
-
-        {signedInEmail && (
-          <p role="status">
-            Logged in as <strong>{signedInEmail}</strong>. The dashboard and
-            protected routes are added in a later step.
           </p>
         )}
 
