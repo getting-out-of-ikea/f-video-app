@@ -42,3 +42,19 @@ body {
 #root {
   width: 100%;
 }
+
+/* Form controls must be at least 16px on mobile: iOS Safari zooms the page in
+   when a focused field's font-size is below 16px, which is also why the page
+   does not zoom back out reliably afterwards.
+
+   Without an explicit size, browsers fall back to their small UI font (~13px)
+   for `input`, `select` and `textarea` — the email/password fields on Login
+   and Signup, the room-id field on the Dashboard, the speaker picker in Room
+   and the controls inside LiveKit's <PreJoin> all inherit that default. This
+   rule keeps the existing card layout untouched; only the text inside the
+   fields is the normal body size. User zoom is deliberately left enabled. */
+input,
+select,
+textarea {
+  font-size: 16px;
+}
